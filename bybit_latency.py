@@ -19,6 +19,8 @@ DEFAULT_WS_URL_SPOT = "wss://stream.bybit.com/v5/public/spot"
 DEFAULT_REST_URL = "https://api.bybit.com/v5/market/time"
 DEFAULT_TOPIC_PREFIX = "tickers."
 
+LOG_LEVELS: Dict[str, int] = {"quiet": 0, "info": 1, "debug": 2}
+
 
 def wall_time_ms() -> float:
     """Wall-clock milliseconds since Unix epoch."""
@@ -32,6 +34,30 @@ def mono_time_ms() -> float:
 
 def utc_iso_from_wall_ms(ms: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ms / 1000.0)) + f".{int(ms % 1000):03d}Z"
+
+
+class Logger:
+    __slots__ = ("_level", "_stream")
+
+    def __init__(self, level: str, stream: Any = None) -> None:
+        self._level = LOG_LEVELS.get(level, 1)
+        self._stream = stream if stream is not None else sys.stderr
+
+    def _log(self, level: int, msg: str) -> None:
+        if self._level < level:
+            return
+        ts = utc_iso_from_wall_ms(wall_time_ms())
+        print(f"[{ts}] {msg}", file=self._stream, flush=True)
+
+    def info(self, msg: str) -> None:
+        self._log(1, msg)
+
+    def debug(self, msg: str) -> None:
+        self._log(2, msg)
+
+    @property
+    def level(self) -> int:
+        return self._level
 
 
 def _to_int(value: Any) -> Optional[int]:
@@ -170,12 +196,16 @@ async def measure_time_sync(
     rest_url: str,
     samples: int,
     timeout_s: float,
+    logger: Logger,
 ) -> TimeSyncResult:
     results: List[TimeSyncSample] = []
     rtts = Stats()
     timeout = aiohttp.ClientTimeout(total=timeout_s)
 
-    for _ in range(max(1, samples)):
+    n = max(1, samples)
+    logger.info(f"time_sync: sampling n={n} rest_url={rest_url}")
+
+    for i in range(n):
         t0 = wall_time_ms()
         async with session.get(rest_url, timeout=timeout) as resp:
             data = await resp.json(content_type=None)
@@ -191,11 +221,13 @@ async def measure_time_sync(
 
         rtts.add(rtt_ms)
         results.append(TimeSyncSample(rtt_ms=rtt_ms, offset_ms=offset_ms, server_time_ms=server_ms))
+        logger.debug(f"time_sync: sample={i + 1}/{n} rtt_ms={rtt_ms:.3f} offset_ms={offset_ms:.3f}")
 
         # Small stagger helps avoid bursting; doesn't affect results meaningfully.
         await asyncio.sleep(0.05)
 
     best = min(results, key=lambda s: s.rtt_ms)
+    logger.info(f"time_sync: best_rtt_ms={best.rtt_ms:.3f} offset_ms={best.offset_ms:.3f}")
     return TimeSyncResult(best=best, rtt_ms=rtts.summary(), samples=results)
 
 
@@ -255,9 +287,12 @@ async def run_ws_latency_test(
     ping_interval_s: float,
     clock_offset_ms: float,
     timeout_s: float,
+    log_interval_s: float,
+    logger: Logger,
 ) -> Tuple[WsMetrics, StatsSummary, StatsSummary, bool, Dict[str, int]]:
     topic = f"{DEFAULT_TOPIC_PREFIX}{symbol}"
     connect_t0 = mono_time_ms()
+    logger.info(f"ws: connecting market={market} ws_url={ws_url} topic={topic}")
 
     counters: Dict[str, int] = {
         "msgs_total": 0,
@@ -277,6 +312,8 @@ async def run_ws_latency_test(
 
     pending_pings: Dict[str, float] = {}  # opaque_id -> mono send time (req_id if supported)
     stop = asyncio.Event()
+    last_ping_rtt_ms: Optional[float] = None
+    last_ticker_latency_ms: Optional[float] = None
 
     async def ping_sender(ws: aiohttp.ClientWebSocketResponse) -> None:
         if ping_interval_s <= 0:
@@ -302,6 +339,23 @@ async def run_ws_latency_test(
                 counters["ping_send_errors"] += 1
                 return
 
+    async def progress_reporter(start_mono: float) -> None:
+        if log_interval_s <= 0 or logger.level < LOG_LEVELS["info"]:
+            return
+        while not stop.is_set():
+            await asyncio.sleep(log_interval_s)
+            if stop.is_set():
+                break
+            elapsed_s = max(0.0, (mono_time_ms() - start_mono) / 1000.0)
+            logger.info(
+                "progress: "
+                f"elapsed_s={elapsed_s:.1f} "
+                f"ticker={counters['msgs_ticker']} "
+                f"pings_sent={counters['pings_sent']} pongs_recv={counters['pongs_recv']} "
+                f"last_ping_rtt_ms={last_ping_rtt_ms} "
+                f"last_ticker_latency_ms={last_ticker_latency_ms}"
+            )
+
     async with session.ws_connect(
         ws_url,
         autoping=False,
@@ -309,11 +363,14 @@ async def run_ws_latency_test(
         max_msg_size=8 * 1024 * 1024,
     ) as ws:
         connect_ms = mono_time_ms() - connect_t0
+        logger.info(f"ws: connected connect_ms={connect_ms:.3f}")
 
         sub_sent_mono = mono_time_ms()
         await ws.send_json({"op": "subscribe", "args": [topic]})
+        logger.info("ws: subscribe sent")
 
         ping_task = asyncio.create_task(ping_sender(ws))
+        progress_task = asyncio.create_task(progress_reporter(sub_sent_mono))
         end_at = mono_time_ms() + (duration_s * 1000.0)
 
         try:
@@ -343,7 +400,8 @@ async def run_ws_latency_test(
                     else:
                         send_mono = None
                     if send_mono is not None:
-                        ping_rtts.add(mono_time_ms() - send_mono)
+                        last_ping_rtt_ms = mono_time_ms() - send_mono
+                        ping_rtts.add(last_ping_rtt_ms)
                     counters["pongs_recv"] += 1
                     continue
 
@@ -370,7 +428,8 @@ async def run_ws_latency_test(
                         else:
                             send_mono = None
                         if send_mono is not None:
-                            ping_rtts.add(mono_time_ms() - send_mono)
+                            last_ping_rtt_ms = mono_time_ms() - send_mono
+                            ping_rtts.add(last_ping_rtt_ms)
                         counters["pongs_recv"] += 1
                         continue
 
@@ -386,28 +445,33 @@ async def run_ws_latency_test(
                     if op == "subscribe" and subscribe_ack_ms is None:
                         # Typical ack: {"success":true,"op":"subscribe",...}
                         subscribe_ack_ms = mono_time_ms() - sub_sent_mono
+                        logger.info(f"ws: subscribe_ack_ms={subscribe_ack_ms:.3f}")
 
                     topic_val = payload.get("topic")
                     if topic_val == topic:
                         counters["msgs_ticker"] += 1
                         if first_ticker_ms is None:
                             first_ticker_ms = mono_time_ms() - sub_sent_mono
+                            logger.info(f"ws: first_ticker_ms={first_ticker_ms:.3f}")
 
                         msg_ts_ms = extract_ws_ts_ms(payload)
                         if msg_ts_ms is None:
                             ticker_ts_missing = True
                             continue
                         recv_wall_ms = wall_time_ms()
-                        latency_ms = (recv_wall_ms + clock_offset_ms) - msg_ts_ms
-                        ticker_latencies.add(latency_ms)
+                        last_ticker_latency_ms = (recv_wall_ms + clock_offset_ms) - msg_ts_ms
+                        ticker_latencies.add(last_ticker_latency_ms)
 
                 elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                     break
         finally:
             stop.set()
             ping_task.cancel()
+            progress_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await ping_task
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await progress_task
 
     ws_metrics = WsMetrics(connect_ms=connect_ms, subscribe_ack_ms=subscribe_ack_ms, first_ticker_ms=first_ticker_ms)
     return ws_metrics, ping_rtts.summary(), ticker_latencies.summary(), ticker_ts_missing, counters
@@ -435,6 +499,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--ping-interval", type=float, default=10.0, help="Send application-level ping every N seconds; 0 disables")
     p.add_argument("--time-sync-samples", type=int, default=10, help="REST time samples used to estimate clock offset")
     p.add_argument("--timeout", type=float, default=5.0, help="Per-request timeout (seconds)")
+    p.add_argument(
+        "--log-level",
+        choices=["quiet", "info", "debug"],
+        default="info",
+        help="Runtime progress logs (printed to stderr)",
+    )
+    p.add_argument(
+        "--log-interval",
+        type=float,
+        default=5.0,
+        help="Progress log interval in seconds during WS run; 0 disables",
+    )
     p.add_argument("--json-out", default="", help="If set, write full JSON result to this path")
     return p
 
@@ -487,6 +563,7 @@ def print_summary(result: RunResult) -> None:
 async def main_async(argv: List[str]) -> int:
     args = build_arg_parser().parse_args(argv)
 
+    logger = Logger(args.log_level)
     started_wall = wall_time_ms()
     hostname = socket.gethostname()
     ws_url = args.ws_url
@@ -499,6 +576,7 @@ async def main_async(argv: List[str]) -> int:
             rest_url=args.rest_url,
             samples=args.time_sync_samples,
             timeout_s=args.timeout,
+            logger=logger,
         )
 
         ws_metrics, ping_stats, ticker_stats, ticker_ts_missing, counters = await run_ws_latency_test(
@@ -510,6 +588,8 @@ async def main_async(argv: List[str]) -> int:
             ping_interval_s=args.ping_interval,
             clock_offset_ms=time_sync.best.offset_ms,
             timeout_s=args.timeout,
+            log_interval_s=args.log_interval,
+            logger=logger,
         )
 
     ended_wall = wall_time_ms()
