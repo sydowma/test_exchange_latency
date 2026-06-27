@@ -1,37 +1,101 @@
-# test_exchange_latency
+# Bybit Latency Bench
 
-## 结论 / Findings（Bybit Spot WS）
+A small, scriptable CLI for measuring Bybit public WebSocket latency across
+cloud regions, availability zones, and network providers.
 
-以下结论来自你提供的实际跑分输出（`--market spot`，订阅 `tickers.BTCUSDT`）。指标解释与脚本输出一致：`ping_rtt_ms` 代表 RTT，`ticker_latency_ms` 代表基于 Bybit `/v5/market/time` 校时后的单向延迟估计。
+It is designed for traders, market-data engineers, and infrastructure builders
+who need a quick way to answer practical questions:
 
-### 1) 不同 Region：AWS SG vs AWS Japan
+- Which region is closest to Bybit public streams?
+- How long does a WebSocket connect and subscription acknowledgement take?
+- What is the p50/p95/p99 ticker delay after clock-syncing against Bybit REST time?
+- Are latency spikes coming from the network, the stream, or local runtime noise?
 
-**结论**：**SG 显著更近**（RTT 与 ticker 延迟低一个数量级），更适合延迟敏感策略。
+## What It Measures
 
-| 指标 | AWS SG | AWS Japan |
-|---|---:|---:|
-| `time_sync.best_rtt_ms` | 6.327 | 72.234 |
-| `ws.connect_ms` | 16.880 | 282.134 |
-| `ws.subscribe_ack_ms` | 2.202 | 68.372 |
-| `ping_rtt_ms.p50` | 2.083 | 68.582 |
-| `ticker_latency_ms.p50` | 4.181 | 35.967 |
-| `ticker_latency_ms.p95` | 6.935 | 36.861 |
+The tool connects to Bybit v5 public WebSocket streams and reports:
 
-### 2) 同 Region（SG）不同区：A / B / C 对比
+- `connect_ms`: time to establish the WebSocket connection.
+- `subscribe_ack_ms`: time from subscription request to acknowledgement.
+- `first_ticker_ms`: time from subscription request to first ticker message.
+- `ping_rtt_ms`: WebSocket or application ping round-trip latency.
+- `ticker_latency_ms`: estimated one-way delay from exchange timestamp to local receive time.
+- `time_sync`: REST time samples used to estimate local clock offset.
 
-**结论**（综合“常态速度 + 尖刺风险”）：推荐 **SG B区**。  
-若你极度关注 **p99 尾部稳定性**，SG C区的 p99 更低，但其 p50 更慢且仍存在大尖刺。
+## Quick Start
 
-| 指标 | SG A区 | SG B区 | SG C区 |
-|---|---:|---:|---:|
-| `ws.connect_ms` | 16.880 | **14.286** | 19.270 |
-| `ws.subscribe_ack_ms` | 2.202 | **1.451** | 2.277 |
-| `ping_rtt_ms.p50` | 2.083 | **1.682** | 2.221 |
-| `ticker_latency_ms.p50` | 4.181 | **3.052** | 5.525 |
-| `ticker_latency_ms.p99` | 22.685 | 18.292 | **8.474** |
-| `ticker_latency_ms.max` | 426.518 | **55.073** | 335.671 |
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 
-### 3) 备注（避免误判）
+python bybit_latency.py --market spot --symbol BTCUSDT --duration 60
+```
 
-- `ping_interval=10s` 在 60s 里只有 ~6 次 ping，p95/p99 的统计不够稳；建议把 `--ping-interval` 调到 **1-2s** 或把 `--duration` 拉长到 **10-30 分钟**再看尾部。
-- SG A区的 `ticker` 计数明显偏少（143 vs 250+），建议同参数再跑一次确认是否偶发。
+For linear perpetual streams:
+
+```bash
+python bybit_latency.py --market linear --symbol BTCUSDT --duration 60
+```
+
+Run a longer region comparison:
+
+```bash
+python bybit_latency.py \
+  --market spot \
+  --symbol BTCUSDT \
+  --duration 600 \
+  --ping-interval 2 \
+  --time-sync-samples 20 \
+  --json-out results-sg.json
+```
+
+## Docker
+
+```bash
+docker build -t bybit-latency-bench .
+docker run --rm bybit-latency-bench --market spot --symbol BTCUSDT --duration 60
+```
+
+## Example Output
+
+```text
+Bybit WS latency test (mainnet spot)
+  market: spot
+  symbol: BTCUSDT
+  duration_s: 60.0  ping_interval_s: 2.0
+
+time_sync:
+  offset_ms: -1.842  best_rtt_ms: 6.327  samples: 20
+ws:
+  connect_ms: 16.880
+  subscribe_ack_ms: 2.202
+  first_ticker_ms: 2.581
+ping_rtt_ms:
+  count=29 min=1.642 avg=2.184 p50=2.083 p95=2.911 p99=4.310 max=4.310
+ticker_latency_ms:
+  count=250 min=1.904 avg=4.882 p50=4.181 p95=6.935 p99=18.292 max=55.073
+```
+
+## Interpreting Results
+
+Use at least 10-30 minutes of samples when comparing p95/p99 latency. A 60
+second run is useful for smoke testing, but tail latency needs more messages.
+
+For fair comparisons:
+
+- Run the same command in each region.
+- Use the same market and symbol.
+- Keep `--time-sync-samples` and `--ping-interval` consistent.
+- Repeat each run at least twice to catch transient stream or VM noise.
+
+## Notes
+
+- The tool uses public market-data endpoints only.
+- One-way delay is an estimate. It depends on Bybit timestamps, REST time-sync
+  quality, local clock behavior, and the selected market stream.
+- This is an infrastructure measurement tool, not trading or investment advice.
+
+## License
+
+Apache License 2.0
